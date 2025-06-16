@@ -1,0 +1,434 @@
+import json
+import requests
+import boto3
+import time
+import os
+import zipfile
+import glob
+import psycopg2
+from psycopg2 import sql
+
+# Get configuration values
+def load_config(configname='config.json'):
+    with open(configname) as config:
+        config_data = json.load(config)
+    return config_data
+
+def initialize_s3_client(config_data):
+    return boto3.client(
+        's3', 
+        aws_access_key_id=config_data["accesskey"], 
+        aws_secret_access_key=config_data["secretkey"],
+        region_name=config_data["region"]
+    )
+
+def list_surveys(datacenter, token):
+    """Get all surveys from Qualtrics API"""
+    list_surveys_url = datacenter + '/API/v3/surveys'
+    headers = {
+        "X-API-TOKEN": token,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:45.0) Gecko/20100101 Firefox/45.0",
+        "accept-encoding": "gzip, deflate"
+    }
+    response = requests.get(url=list_surveys_url, headers=headers)
+    results = json.loads(response.text)
+    return results["result"]["elements"]
+
+def get_survey_definitions(datacenter, token, survey_id, survey_name, file_location, s3, s3bucket, survey_files):
+    """Get survey definition and questions, transform into flattened format"""
+    get_surveys_url = datacenter + '/API/v3/surveys/' + survey_id
+    headers = {
+        "X-API-TOKEN": token,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:45.0) Gecko/20100101 Firefox/45.0",
+        "accept-encoding": "gzip, deflate"
+    }
+    response = requests.get(url=get_surveys_url, headers=headers)
+    results = json.loads(response.text)
+    
+    # Create a new list to hold the formatted values
+    survey_questions = []
+    
+    # Load the questions into a new list
+    question_collection = results['result']['questions']
+    for question_id in question_collection:
+        # Test if subQuestions exist in the current Question
+        if 'subQuestions' in question_collection[question_id]:
+            subquestion_collection = question_collection[question_id]['subQuestions']
+            for subquestion_id in subquestion_collection:
+                # Create the new subquestion record
+                survey_record = {
+                    'SurveyID': results['result']['id'], 
+                    'SurveyName': results['result']['name'], 
+                    'SurveyOwner': results['result']['ownerId'],
+                    'SurveyLastModifiedDate': results['result']['lastModifiedDate'], 
+                    'SurveyIsActive': results['result']['isActive'], 
+                    'ParentQuestionID': question_id, 
+                    'ParentQuestionName': question_collection[question_id]['questionName'], 
+                    'ParentQuestionText': question_collection[question_id]['questionText'], 
+                    'ParentQuestionType': question_collection[question_id]['questionType']['type'], 
+                    'QuestionID': question_id + '_' + subquestion_id, 
+                    'QuestionName': question_collection[question_id]['questionName'] + ' - ' + subquestion_collection[subquestion_id]['description'], 
+                    'QuestionText': question_collection[question_id]['questionText'] + ' - ' + subquestion_collection[subquestion_id]['choiceText'], 
+                    'IsSubQuestion': True
+                }
+                # Add the record to the formatted list
+                survey_questions.append(survey_record)
+        else:
+            # Create the new Question record for questions with no subquestions
+            survey_record = {
+                'SurveyID': results['result']['id'], 
+                'SurveyName': results['result']['name'], 
+                'SurveyOwner': results['result']['ownerId'], 
+                'SurveyLastModifiedDate': results['result']['lastModifiedDate'], 
+                'SurveyIsActive': results['result']['isActive'], 
+                'ParentQuestionID': question_id, 
+                'ParentQuestionName': question_collection[question_id]['questionName'], 
+                'ParentQuestionText': question_collection[question_id]['questionText'], 
+                'ParentQuestionType': question_collection[question_id]['questionType']['type'], 
+                'QuestionID': question_id, 
+                'QuestionName': question_collection[question_id]['questionName'], 
+                'QuestionText': question_collection[question_id]['questionText'], 
+                'IsSubQuestion': False
+            }
+            # Add the record to the formatted list
+            survey_questions.append(survey_record)
+    
+    # Create the file to hold the raw JSON from Qualtrics
+    raw_output_file = os.path.join(file_location, f"{survey_name}_raw_{int(time.time())}.json")
+    with open(raw_output_file, 'w') as outfile:
+        json.dump(results, outfile)
+    
+    # Create the file to hold the new formatted JSON from Qualtrics
+    formatted_output_file = os.path.join(file_location, f"{survey_name}_format_{int(time.time())}.json")
+    s3_filename = f"SurveyFiles/{survey_name}_format_{int(time.time())}.json"
+    
+    with open(formatted_output_file, 'w') as outfile:
+        for i, entry in enumerate(survey_questions):
+            json.dump(entry, outfile, indent=0)
+            outfile.write('\n')
+    
+    # Upload to S3
+    s3.upload_file(formatted_output_file, s3bucket, s3_filename)
+    
+    # Add to manifest
+    s3_full_path = f"s3://{s3bucket}/{s3_filename}"
+    output_manifest = {'url': s3_full_path, 'mandatory': True}     
+    survey_files.append(output_manifest)
+    
+    return survey_questions
+
+def build_survey_export(datacenter, token, survey_id, data_format, use_labels, debug_mode=False):
+    """Request Qualtrics to prepare a survey response export file"""
+    build_url = datacenter + "/API/v3/responseexports"
+    
+    if debug_mode:
+        print(build_url)
+    
+    payload = {
+        "format": data_format,
+        "surveyId": survey_id,
+        "useLabels": use_labels
+    }
+    
+    headers = {
+        "Accept": "*/*",
+        "X-API-TOKEN": token,
+        "accept-encoding": "gzip, deflate",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:45.0) Gecko/20100101 Firefox/45.0",
+        "content-type": "application/json"
+    }   
+    
+    if debug_mode:
+        print(payload)
+        print(headers)
+    
+    response = requests.post(url=build_url, data=json.dumps(payload), headers=headers)
+    
+    if debug_mode:
+        print(response.text)
+    
+    results = json.loads(response.text)
+    survey_token = results["result"]["id"]
+    return survey_token
+
+def check_export_status(survey_token, datacenter, token, debug_mode=False):
+    """Check if the requested export is complete"""
+    if debug_mode:
+        print(survey_token)
+    
+    status_url = datacenter + '/API/v3/responseexports/' + survey_token
+    
+    if debug_mode:
+        print(status_url)
+    
+    headers = {
+        "X-API-TOKEN": token,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:45.0) Gecko/20100101 Firefox/45.0",
+        "accept-encoding": "gzip, deflate"
+    }
+    
+    if debug_mode:
+        print(headers)
+    
+    response = requests.get(url=status_url, headers=headers)
+    
+    if debug_mode:
+        print(response.text)
+    
+    results = json.loads(response.text)
+    percent_complete = results["result"]["percentComplete"]
+    
+    if debug_mode:
+        print(percent_complete)
+    
+    return percent_complete
+
+def get_survey_responses(survey_token, datacenter, token, survey_id, file_location, s3, s3bucket, result_files, debug_mode=False):
+    """Download and process the completed survey response export"""
+    if debug_mode:
+        print(survey_token)
+    
+    download_url = datacenter + '/API/v3/responseexports/' + survey_token + '/file'
+    
+    if debug_mode:
+        print(download_url)
+    
+    headers = {
+        "X-API-TOKEN": token,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:45.0) Gecko/20100101 Firefox/45.0",
+        "accept-encoding": "gzip, deflate"
+    }
+    
+    if debug_mode:
+        print(headers)
+    
+    response_set = []
+    response = requests.get(url=download_url, headers=headers, stream=True)
+    
+    # Save the zip file
+    zip_path = os.path.join(file_location, "RequestFile.zip")
+    with open(zip_path, 'wb') as fd:
+        for chunk in response.iter_content(chunk_size=128):
+            fd.write(chunk)
+    
+    # Extract the file from the zipfile archive        
+    zipfile.ZipFile(zip_path).extractall(file_location)
+    
+    # Get the filename of the archive file
+    survey_file_collection = zipfile.ZipFile(zip_path).infolist()
+    survey_file_name = survey_file_collection[0].filename
+    
+    # Read the data from the archive zip file to manipulate it
+    with open(os.path.join(file_location, survey_file_name)) as request_file:
+        request = json.load(request_file)
+    
+    base_file_name = survey_file_name.replace(".json", "")
+    
+    # Create a new collection to hold just the responses and append the Survey ID to each response
+    for response_set_id in request["responses"]:
+        response_collection = response_set_id
+        
+        # Pivot the responses into a single record for each question/response line
+        for response_id in response_collection:
+            if response_id in ["ResponseID", "ResponseSet", "IPAddress", "StartDate", "EndDate", 
+                              "RecipientLastName", "RecipientFirstName", "RecipientEmail", 
+                              "Finished", "Status", "LocationLatitude", "LocationLongitude"]:
+                continue
+                
+            response_row = {}
+            response_row["Survey_ID"] = survey_id
+            response_row["Response_ID"] = response_set_id["ResponseID"] 
+            response_row["Response_Set"] = response_set_id["ResponseSet"]
+            response_row["IP_Address"] = response_set_id["IPAddress"] 
+            response_row["Start_Date"] = response_set_id["StartDate"]  
+            response_row["End_Date"] = response_set_id["EndDate"] 
+            response_row["Recipient_Lastname"] = response_set_id["RecipientLastName"]
+            response_row["Recipient_Firstname"] = response_set_id["RecipientFirstName"]
+            response_row["Recipient_Email"] = response_set_id["RecipientEmail"]
+            response_row["Finished"] = response_set_id["Finished"]
+            response_row["Status"] = response_set_id["Status"]
+            response_row["Location_Latitude"] = response_set_id["LocationLatitude"]
+            response_row["Location_Longitude"] = response_set_id["LocationLongitude"]
+            response_row["Question_ID"] = response_id
+            response_row["Result"] = response_collection[response_id]
+            response_set.append(response_row)
+    
+    # Create the file to hold the new formatted JSON from Qualtrics
+    output_file = os.path.join(file_location, f"{base_file_name}{int(time.time())}_results.json")
+    s3_filename = f"ResultFiles/{base_file_name}{int(time.time())}_results.json"
+    
+    with open(output_file, 'w') as outfile:
+        for i, entry in enumerate(response_set):
+            json.dump(entry, outfile, indent=0)
+            outfile.write('\n')
+    
+    # Upload to S3
+    s3.upload_file(output_file, s3bucket, s3_filename)
+    
+    # Add to manifest for results
+    s3_full_path = f"s3://{s3bucket}/{s3_filename}"
+    output_manifest = {'url': s3_full_path, 'mandatory': True}
+    result_files.append(output_manifest)
+    
+    return response_set
+
+def create_manifest_files(survey_files, result_files, file_location, s3, s3bucket):
+    """Create manifest files for survey questions and response data"""
+    # Build the manifest file for the survey question files
+    survey_manifest = {'entries': survey_files}
+    survey_manifest_file = f"survey_{int(time.time())}.manifest"
+    survey_manifest_path = os.path.join(file_location, survey_manifest_file)
+    
+    with open(survey_manifest_path, 'w') as outfile:
+        json.dump(survey_manifest, outfile)
+    
+    s3.upload_file(survey_manifest_path, s3bucket, survey_manifest_file)
+    
+    # Upload the JSONPaths file for surveys
+    survey_jsonpath_file = "QualtricsSurveysJSONPaths.json"
+    s3.upload_file(survey_jsonpath_file, s3bucket, survey_jsonpath_file)
+    
+    # Build the manifest file for the result files
+    results_manifest = {'entries': result_files}
+    results_manifest_file = f"results_{int(time.time())}.manifest"
+    results_manifest_path = os.path.join(file_location, results_manifest_file)
+    
+    with open(results_manifest_path, 'w') as outfile:
+        json.dump(results_manifest, outfile)
+    
+    s3.upload_file(results_manifest_path, s3bucket, results_manifest_file)
+    
+    # Upload the JSONPaths file for results
+    results_jsonpath_file = "QualtricsResultsJSONPaths.json"
+    s3.upload_file(results_jsonpath_file, s3bucket, results_jsonpath_file)
+    
+    return survey_manifest_file, results_manifest_file
+
+def load_redshift_data(table_name, manifest, jsonpath_file, config_data):
+    """Load data from S3 into Redshift using COPY command"""
+    conn = psycopg2.connect(
+        dbname=config_data["database"], 
+        host=config_data["host"],
+        port=config_data["port"], 
+        user=config_data["user"], 
+        password=config_data["password"]
+    )
+    
+    cursor = conn.cursor()
+    
+    # Copy query with proper SQL injection protection
+    query = "COPY {} FROM %s ACCESS_KEY_ID %s SECRET_ACCESS_KEY %s TIMEFORMAT 'auto' BLANKSASNULL JSON %s REGION %s MANIFEST;"
+    
+    # Safely format schema and table names
+    schema_name = config_data["schema_name"]
+    formatted_query = cursor.mogrify(
+        sql.SQL(query).format(sql.SQL('.').join([sql.Identifier(schema_name), sql.Identifier(table_name)])), 
+        (manifest, config_data["accesskey"], config_data["secretkey"], jsonpath_file, config_data["region"])
+    )
+    
+    # Execute the query
+    cursor.execute(formatted_query)
+    conn.commit()
+    
+    cursor.close()
+    conn.close()
+
+def cleanup_local_files(file_location):
+    """Clean up temporary local files after processing"""
+    os.chdir(file_location)
+    files = glob.glob('*.*')
+    for filename in files:
+        os.unlink(filename)
+
+def main():
+    # Load configuration
+    config_data = load_config()
+    
+    # Setup initial variables from config
+    accesskey = config_data["accesskey"]
+    secretkey = config_data["secretkey"]
+    data_center = config_data["Data_Center"]
+    token = config_data["Token"]
+    file_location = config_data["File_Location"]
+    data_format = config_data["Data_Format"]
+    s3bucket = config_data["s3bucket"]
+    survey_db_table = config_data["Survey_Database_Load_Table"]
+    results_db_table = config_data["Results_Database_Load_Table"]
+    
+    # Initialize S3 client
+    s3 = initialize_s3_client(config_data)
+    
+    # Lists to track files for manifests
+    survey_files = []
+    result_files = []
+    
+    try:
+        print('Getting all surveys')
+        # Get all surveys from Qualtrics
+        all_surveys = list_surveys(data_center, token)
+        
+        # Filter for surveys that start with "AP_"
+        ap_surveys = [survey for survey in all_surveys if survey["name"].startswith("AP_")]
+        
+        for survey in ap_surveys:
+            try:
+                # Get survey definition and questions
+                print(f"Processing survey: {survey['name']}")
+                get_survey_definitions(
+                    data_center, token, survey["id"], survey["name"], 
+                    file_location, s3, s3bucket, survey_files
+                )
+                
+                # Request export of survey responses
+                print(f"Requesting response export for: {survey['name']}")
+                survey_token = build_survey_export(data_center, token, survey["id"], data_format, True)
+                
+                # Wait for export to complete
+                print("Waiting for export to complete...")
+                while True:
+                    percent_complete = check_export_status(survey_token, data_center, token)
+                    print(f"Export progress: {percent_complete}%")
+                    if percent_complete == 100.0:
+                        break
+                    time.sleep(2)  # Wait 2 seconds before checking again
+                
+                # Download and process survey responses
+                print("Downloading and processing responses...")
+                get_survey_responses(
+                    survey_token, data_center, token, survey["id"],
+                    file_location, s3, s3bucket, result_files
+                )
+                
+            except Exception as e:
+                print(f"Error processing survey {survey['name']}: {str(e)}")
+        
+        # Create manifest files for Redshift loading
+        print("Creating manifest files...")
+        survey_manifest, results_manifest = create_manifest_files(
+            survey_files, result_files, file_location, s3, s3bucket
+        )
+        
+        # Set full S3 paths for manifests
+        survey_manifest_path = f"s3://{s3bucket}/{survey_manifest}"
+        survey_jsonpath = f"s3://{s3bucket}/QualtricsSurveysJSONPaths.json"
+        results_manifest_path = f"s3://{s3bucket}/{results_manifest}"
+        results_jsonpath = f"s3://{s3bucket}/QualtricsResultsJSONPaths.json"
+        
+        # Load data into Redshift
+        print("Loading survey definitions into Redshift...")
+        load_redshift_data(survey_db_table, survey_manifest_path, survey_jsonpath, config_data)
+        
+        print("Loading survey responses into Redshift...")
+        load_redshift_data(results_db_table, results_manifest_path, results_jsonpath, config_data)
+        
+        # Clean up local files
+        print("Cleaning up temporary files...")
+        cleanup_local_files(file_location)
+        
+        print("ETL process completed successfully!")
+        
+    except Exception as e:
+        print(f"An error occurred during ETL process: {str(e)}")
+
+if __name__ == "__main__":
+    main()
